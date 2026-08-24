@@ -1,3 +1,120 @@
+# Auto Bidding — LightGBM Regression Experiment
+
+## 1. Objective
+
+CTR 기반 bidding과 **LightGBM value-based auto bidding**을 비교하여 동일한 수준의 budget에서 business outcome이 어떻게 변하는지 평가했다.
+
+---
+
+## 2. Model
+
+### Input
+
+```text
+campaign
+cat1 ~ cat9
+hour
+day
+pCTR
+```
+
+총 **13개 feature**를 사용했다.
+
+### Output
+
+```text
+Predicted Expected Value
+```
+
+LightGBM Regression으로 각 impression의 expected business value를 예측했다.
+
+```text
+Input Features + pCTR
+        ↓
+LightGBM Regressor
+        ↓
+Predicted Value
+        ↓
+Bid = multiplier × predicted value
+```
+
+### Training
+
+```text
+Training samples: 700,000
+Objective       : Tweedie Regression
+Prediction MAE  : 0.007183
+```
+
+---
+
+## 3. Bidding Strategies
+
+**CTR Baseline**
+
+```text
+bid = 0.001176 × pCTR
+```
+
+CTR이 높은 impression에 더 높은 bid를 할당한다.
+
+**Auto Bidding**
+
+```text
+bid = 0.151672 × predicted_value
+```
+
+예측된 business value가 높은 impression에 더 높은 bid를 할당한다.
+
+두 multiplier는 validation set에서 **비슷한 budget을 사용하도록 calibration**했다.
+
+Test target budget:
+
+```text
+Historical spend = 40.8259
+Target budget    = 12.2478 (30%)
+```
+
+---
+
+## 4. Business Outcome
+
+| Metric      | CTR Baseline | Auto Bidding |        Change |
+| ----------- | -----------: | -----------: | ------------: |
+| Impressions |      122,672 |       76,270 |    **-37.8%** |
+| Clicks      |       38,071 |       24,599 |    **-35.4%** |
+| Conversions |        4,107 |        3,876 |    **-5.62%** |
+| CTR         |       31.03% |       32.25% |    **+3.92%** |
+| CVR         |       10.79% |       15.76% |   **+46.06%** |
+| Spend       |       12.248 |       11.919 |    **-2.69%** |
+| Revenue     |       375.82 |       395.52 |    **+5.24%** |
+| CPA         |     0.002982 |     0.003075 | **+3.11% ⚠️** |
+| ROAS        |        30.68 |        33.18 |    **+8.15%** |
+| Profit      |       363.57 |       383.60 |    **+5.51%** |
+
+---
+
+## 5. Interpretation
+
+Auto bidding은 **더 적은 impression을 선택하면서 가치가 높은 traffic에 집중**했다.
+
+```text
+Impressions ↓ 37.8%
+        ↓
+Higher-value traffic selection
+        ↓
+CVR ↑ 46.1%
+Revenue ↑ 5.2%
+ROAS ↑ 8.2%
+Profit ↑ 5.5%
+```
+
+따라서 **value/ROAS 관점에서는 Auto Bidding이 CTR baseline보다 우수**했다.
+
+다만 CPA는 `+3.11%`로 소폭 악화되었고 conversions도 `-5.62%` 감소했다. 즉 이 모델은 **CPA/Conversion 최대화 모델이 아니라 value 최적화 모델**이므로 자연스러운 trade-off다.
+
+> **Conclusion:** Value-based LightGBM bidding improved ROAS by **8.15%** and profit by **5.51%**, while sacrificing **5.62% of conversions** and worsening CPA by **3.11%**. The bidder therefore learned to purchase fewer but higher-value impressions.
+
 # Advertising System Experiment
 
 ## 1. Overview
@@ -470,4 +587,5 @@ pacing allocates a limited campaign budget over time.**
 
 수치는 실제 실행 결과를 그대로 반영했습니다. 특히 첫 번째 Criteo targeting은 AUC `0.6992`와 Top-1% lift `6.29x`였고 :contentReference[oaicite:0]{index=0}, 최종 AuctionNet 실험에서는 Q-learning pacing이 expected conversion을 `766.57 → 1735.08`로 높이는 대신 CPA와 pacing error가 악화되는 trade-off가 나타났습니다. :contentReference[oaicite:1]{index=1}
 ```
+
 
