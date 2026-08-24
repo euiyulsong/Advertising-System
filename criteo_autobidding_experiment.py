@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 
 from datasets import load_dataset
-from lightgbm import LGBMClassifier, LGBMRegressor
-from sklearn.metrics import roc_auc_score, log_loss, mean_absolute_error
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score, log_loss
 
 warnings.filterwarnings("ignore")
 
@@ -20,27 +20,6 @@ SEED = 42
 # ============================================================
 
 def load_criteo(num_rows=1_000_000):
-    """
-    Criteo Attribution Dataset.
-
-    Expected columns roughly:
-        timestamp
-        uid
-        campaign
-        conversion
-        conversion_timestamp
-        conversion_id
-        attribution
-        click
-        click_pos
-        click_nb
-        cost
-        cpo
-        cat1 ~ cat9
-
-    Streaming is used because full dataset is large.
-    """
-
     ds = load_dataset(
         "criteo/criteo-attribution-dataset",
         split="train",
@@ -69,7 +48,7 @@ def load_criteo(num_rows=1_000_000):
 
 
 # ============================================================
-# 2. Feature engineering
+# 2. Preprocess
 # ============================================================
 
 def preprocess(df):
@@ -82,9 +61,10 @@ def preprocess(df):
             errors="coerce",
         ).fillna(0)
 
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = df.sort_values(
+            "timestamp"
+        ).reset_index(drop=True)
 
-        # timestamp is seconds in this dataset
         df["hour"] = (
             (df["timestamp"] // 3600) % 24
         ).astype(int)
@@ -92,6 +72,20 @@ def preprocess(df):
         df["day"] = (
             df["timestamp"] // (3600 * 24)
         ).astype(int)
+
+    # numeric labels / auction fields
+    numeric_cols = [
+        "click",
+        "conversion",
+        "cost",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            ).fillna(0)
 
     # categorical features
     categorical_cols = [
@@ -115,52 +109,6 @@ def preprocess(df):
     for c in categorical_cols:
         df[c] = df[c].astype("category")
 
-    # labels
-    for col in [
-        "click",
-        "conversion",
-        "attribution",
-        "cost",
-        "cpo",
-    ]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            ).fillna(0)
-
-    # --------------------------------------------------------
-    # Business value label
-    # --------------------------------------------------------
-    #
-    # attribution:
-    #   conversion attribution weight
-    #
-    # cpo:
-    #   value / cost-per-order related signal
-    #
-    # realized_value is our offline "revenue" approximation.
-    #
-    # Depending on dataset version, you can replace this with:
-    #
-    #   conversion * FIXED_VALUE
-    #
-    # if desired.
-    #
-
-    if "cpo" in df.columns:
-        df["realized_value"] = (
-            df["conversion"]
-            * df["cpo"]
-        )
-    else:
-        # simple fallback
-        CONVERSION_VALUE = 10.0
-        df["realized_value"] = (
-            df["conversion"]
-            * CONVERSION_VALUE
-        )
-
     return df, categorical_cols
 
 
@@ -175,8 +123,13 @@ def time_split(df):
     valid_end = int(n * 0.85)
 
     train = df.iloc[:train_end].copy()
-    valid = df.iloc[train_end:valid_end].copy()
-    test = df.iloc[valid_end:].copy()
+    valid = df.iloc[
+        train_end:valid_end
+    ].copy()
+
+    test = df.iloc[
+        valid_end:
+    ].copy()
 
     print("\nSplit")
     print("Train:", len(train))
@@ -207,11 +160,13 @@ def train_ctr_model(
         learning_rate=0.05,
         num_leaves=63,
         max_depth=-1,
+        min_child_samples=50,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=SEED,
         n_jobs=-1,
+        verbosity=-1,
     )
 
     model.fit(
@@ -224,10 +179,9 @@ def train_ctr_model(
         eval_set=[
             (
                 valid[feature_cols],
-                valid["click"]
+                valid["click"],
             )
         ],
-        callbacks=[],
     )
 
     pred = model.predict_proba(
@@ -236,12 +190,12 @@ def train_ctr_model(
 
     auc = roc_auc_score(
         valid["click"],
-        pred
+        pred,
     )
 
     ll = log_loss(
         valid["click"],
-        pred
+        pred,
     )
 
     print(f"CTR AUC     : {auc:.6f}")
@@ -251,7 +205,7 @@ def train_ctr_model(
 
 
 # ============================================================
-# 5. Generate pCTR
+# 5. Add pCTR
 # ============================================================
 
 def add_pctr(
@@ -269,10 +223,10 @@ def add_pctr(
 
 
 # ============================================================
-# 6. Auto bidding model
+# 6. Conversion model
 # ============================================================
 
-def train_bidding_model(
+def train_conversion_model(
     train,
     valid,
     feature_cols,
@@ -280,69 +234,49 @@ def train_bidding_model(
 ):
 
     print("\n" + "=" * 70)
-    print("TRAIN AUTO-BIDDING MODEL")
+    print("TRAIN CONVERSION MODEL")
     print("=" * 70)
 
-    #
-    # Most impressions have zero value.
-    # Tweedie works reasonably well for
-    # zero-heavy positive targets.
-    #
-
-    model = LGBMRegressor(
-        objective="tweedie",
-        tweedie_variance_power=1.5,
-
+    model = LGBMClassifier(
+        objective="binary",
         n_estimators=700,
         learning_rate=0.04,
-
         num_leaves=63,
         max_depth=-1,
-
         min_child_samples=100,
-
         subsample=0.8,
         colsample_bytree=0.8,
-
         reg_lambda=2.0,
-
         random_state=SEED,
         n_jobs=-1,
+        verbosity=-1,
     )
 
     model.fit(
         train[feature_cols],
-        train["realized_value"],
-
+        train["conversion"],
         categorical_feature=[
             c for c in categorical_cols
             if c in feature_cols
         ],
-
         eval_set=[
             (
                 valid[feature_cols],
-                valid["realized_value"]
+                valid["conversion"],
             )
         ],
     )
 
-    pred = np.maximum(
-        model.predict(
-            valid[feature_cols]
-        ),
-        0,
-    )
+    pred = model.predict_proba(
+        valid[feature_cols]
+    )[:, 1]
 
-    mae = mean_absolute_error(
-        valid["realized_value"],
+    auc = roc_auc_score(
+        valid["conversion"],
         pred,
     )
 
-    print(
-        f"Value prediction MAE: "
-        f"{mae:.6f}"
-    )
+    print(f"Conversion AUC: {auc:.6f}")
 
     return model
 
@@ -356,27 +290,15 @@ def simulate_auction(
     bids,
     budget=None,
 ):
-    """
-    Simple offline replay.
-
-    Assumption:
-        historical cost ~= market clearing price
-
-    Win:
-        bid >= cost
-
-    Important:
-        This is NOT a perfect counterfactual auction simulator.
-        It is an offline approximation for experimentation.
-    """
-
     result = df.copy()
 
     result["bid"] = np.maximum(
         bids,
-        0
+        0,
     )
 
+    # historical cost is used as
+    # approximate clearing price
     result["win"] = (
         result["bid"]
         >= result["cost"]
@@ -386,15 +308,9 @@ def simulate_auction(
         result["win"] == 1
     ].copy()
 
-    # --------------------------------------------------------
-    # Budget constraint
-    # --------------------------------------------------------
-
     if budget is not None:
-
         winners["cum_spend"] = (
-            winners["cost"]
-            .cumsum()
+            winners["cost"].cumsum()
         )
 
         winners = winners[
@@ -402,7 +318,7 @@ def simulate_auction(
             <= budget
         ]
 
-    spend = winners["cost"].sum()
+    impressions = len(winners)
 
     clicks = winners["click"].sum()
 
@@ -410,11 +326,7 @@ def simulate_auction(
         winners["conversion"].sum()
     )
 
-    revenue = (
-        winners["realized_value"].sum()
-    )
-
-    impressions = len(winners)
+    spend = winners["cost"].sum()
 
     ctr = (
         clicks / impressions
@@ -434,13 +346,12 @@ def simulate_auction(
         else np.inf
     )
 
-    roas = (
-        revenue / spend
-        if spend > 0
-        else 0
+    budget_utilization = (
+        spend / budget
+        if budget is not None
+        and budget > 0
+        else np.nan
     )
-
-    profit = revenue - spend
 
     return {
         "impressions": impressions,
@@ -449,15 +360,13 @@ def simulate_auction(
         "CTR": ctr,
         "CVR": cvr,
         "spend": spend,
-        "revenue": revenue,
         "CPA": cpa,
-        "ROAS": roas,
-        "profit": profit,
+        "budget_utilization": budget_utilization,
     }
 
 
 # ============================================================
-# 8. Find bid multiplier
+# 8. Tune multiplier to budget
 # ============================================================
 
 def find_multiplier_for_budget(
@@ -465,27 +374,22 @@ def find_multiplier_for_budget(
     raw_scores,
     target_budget,
 ):
-    """
-    Search multiplier so predicted scores
-    generate approximately the target spend.
-
-        bid = score * multiplier
-    """
-
     multipliers = np.logspace(
-        -3,
-        4,
-        200,
+        -6,
+        5,
+        400,
     )
 
     best_mult = 1.0
     best_diff = np.inf
+    best_spend = None
+
+    costs = df["cost"].values
 
     for mult in multipliers:
-
         bids = raw_scores * mult
 
-        win = bids >= df["cost"].values
+        win = bids >= costs
 
         spend = df.loc[
             win,
@@ -499,20 +403,25 @@ def find_multiplier_for_budget(
         if diff < best_diff:
             best_diff = diff
             best_mult = mult
+            best_spend = spend
+
+    print(
+        f"  calibration spend = "
+        f"{best_spend:.6f}"
+    )
 
     return best_mult
 
 
 # ============================================================
-# 9. Pretty comparison
+# 9. Print comparison
 # ============================================================
 
 def print_comparison(
     baseline,
     autobid,
 ):
-
-    df = pd.DataFrame(
+    result_df = pd.DataFrame(
         {
             "CTR baseline": baseline,
             "Auto bidding": autobid,
@@ -524,7 +433,7 @@ def print_comparison(
     print("=" * 80)
 
     print(
-        df[
+        result_df[
             [
                 "impressions",
                 "clicks",
@@ -532,10 +441,8 @@ def print_comparison(
                 "CTR",
                 "CVR",
                 "spend",
-                "revenue",
                 "CPA",
-                "ROAS",
-                "profit",
+                "budget_utilization",
             ]
         ].to_string()
     )
@@ -544,15 +451,13 @@ def print_comparison(
     print("AUTO-BIDDING LIFT")
     print("=" * 80)
 
-    for metric in [
+    higher_is_better = [
         "CTR",
         "CVR",
         "conversions",
-        "revenue",
-        "ROAS",
-        "profit",
-    ]:
+    ]
 
+    for metric in higher_is_better:
         b = baseline[metric]
         a = autobid[metric]
 
@@ -566,15 +471,15 @@ def print_comparison(
         )
 
         print(
-            f"{metric:12s}: "
+            f"{metric:20s}: "
             f"{lift:+.2f}%"
         )
 
-    if np.isfinite(
-        baseline["CPA"]
-    ) and baseline["CPA"] != 0:
-
-        lift = (
+    if (
+        np.isfinite(baseline["CPA"])
+        and baseline["CPA"] != 0
+    ):
+        cpa_change = (
             (
                 autobid["CPA"]
                 - baseline["CPA"]
@@ -584,8 +489,8 @@ def print_comparison(
         )
 
         print(
-            f"{'CPA':12s}: "
-            f"{lift:+.2f}% "
+            f"{'CPA':20s}: "
+            f"{cpa_change:+.2f}% "
             f"(lower is better)"
         )
 
@@ -596,6 +501,10 @@ def print_comparison(
 
 def main(args):
 
+    # --------------------------------------------------------
+    # Load
+    # --------------------------------------------------------
+
     df = load_criteo(
         args.rows
     )
@@ -604,27 +513,51 @@ def main(args):
         df
     )
 
+    print("\nLabel statistics")
+    print(
+        f"CTR        : "
+        f"{df['click'].mean():.6f}"
+    )
+
+    print(
+        f"Conversion : "
+        f"{df['conversion'].mean():.6f}"
+    )
+
+    print(
+        f"Cost mean  : "
+        f"{df['cost'].mean():.8f}"
+    )
+
+    print(
+        f"Cost sum   : "
+        f"{df['cost'].sum():.6f}"
+    )
+
+    # --------------------------------------------------------
+    # Split
+    # --------------------------------------------------------
+
     train, valid, test = time_split(
         df
     )
 
     # --------------------------------------------------------
-    # Pre-auction feature only.
+    # Pre-auction features
     #
-    # DO NOT use:
-    #     click
-    #     conversion
-    #     attribution
-    #     cost
-    #     cpo
+    # Never use:
+    # click
+    # conversion
+    # cost
+    # attribution
+    # cpo
     #
-    # because they are future/post-auction signals.
+    # as input features.
     # --------------------------------------------------------
 
     feature_cols = [
         c for c in [
             "campaign",
-
             "cat1",
             "cat2",
             "cat3",
@@ -634,7 +567,6 @@ def main(args):
             "cat7",
             "cat8",
             "cat9",
-
             "hour",
             "day",
         ]
@@ -647,7 +579,7 @@ def main(args):
     )
 
     # ========================================================
-    # CTR
+    # 1. CTR model
     # ========================================================
 
     ctr_model = train_ctr_model(
@@ -675,18 +607,18 @@ def main(args):
         feature_cols,
     )
 
-    test_auc = roc_auc_score(
+    test_ctr_auc = roc_auc_score(
         test["click"],
         test["pctr"],
     )
 
     print(
         f"\nTEST CTR AUC: "
-        f"{test_auc:.6f}"
+        f"{test_ctr_auc:.6f}"
     )
 
     # ========================================================
-    # Auto bidding regression
+    # 2. Conversion model
     # ========================================================
 
     bid_features = (
@@ -694,8 +626,13 @@ def main(args):
         + ["pctr"]
     )
 
-    bidding_model = (
-        train_bidding_model(
+    print(
+        "\nConversion features:",
+        bid_features
+    )
+
+    conversion_model = (
+        train_conversion_model(
             train,
             valid,
             bid_features,
@@ -703,71 +640,76 @@ def main(args):
         )
     )
 
-    train["pred_value"] = np.maximum(
-        bidding_model.predict(
+    # --------------------------------------------------------
+    # Generate pCVR
+    # --------------------------------------------------------
+
+    train["pcvr"] = (
+        conversion_model.predict_proba(
             train[bid_features]
-        ),
-        0,
+        )[:, 1]
     )
 
-    valid["pred_value"] = np.maximum(
-        bidding_model.predict(
+    valid["pcvr"] = (
+        conversion_model.predict_proba(
             valid[bid_features]
-        ),
-        0,
+        )[:, 1]
     )
 
-    test["pred_value"] = np.maximum(
-        bidding_model.predict(
+    test["pcvr"] = (
+        conversion_model.predict_proba(
             test[bid_features]
-        ),
-        0,
+        )[:, 1]
+    )
+
+    test_conversion_auc = roc_auc_score(
+        test["conversion"],
+        test["pcvr"],
+    )
+
+    print(
+        f"TEST Conversion AUC: "
+        f"{test_conversion_auc:.6f}"
     )
 
     # ========================================================
-    # Budget
+    # 3. Budget
     # ========================================================
-    #
-    # Example:
-    # Spend 30% of historical test spend.
-    #
 
-    total_test_cost = (
+    historical_test_spend = (
         test["cost"].sum()
     )
 
-    budget = (
-        total_test_cost
+    target_budget = (
+        historical_test_spend
         * args.budget_ratio
     )
-
-    print(
-        f"\nHistorical test spend: "
-        f"{total_test_cost:.4f}"
-    )
-
-    print(
-        f"Target budget         : "
-        f"{budget:.4f}"
-    )
-
-    # ========================================================
-    # Tune multiplier on validation
-    # ========================================================
 
     validation_budget = (
         valid["cost"].sum()
         * args.budget_ratio
     )
 
-    # --------------------------------------------------------
-    # Baseline:
-    #
-    # bid = alpha * pCTR
-    #
-    # Equivalent to old/simple bidding logic:
-    # high click probability -> higher bid
-    # --------------------------------------------------------
+    print(
+        f"\nHistorical test spend: "
+        f"{historical_test_spend:.6f}"
+    )
+
+    print(
+        f"Target budget         : "
+        f"{target_budget:.6f}"
+    )
+
+    print(
+        f"Validation budget     : "
+        f"{validation_budget:.6f}"
+    )
+
+    # ========================================================
+    # 4. Tune bidding multipliers on validation
+    # ========================================================
+
+    print("\nCalibrating CTR baseline")
 
     ctr_multiplier = (
         find_multiplier_for_budget(
@@ -777,54 +719,58 @@ def main(args):
         )
     )
 
-    # --------------------------------------------------------
-    # Auto bidder:
-    #
-    # bid = beta * expected conversion value
-    # --------------------------------------------------------
+    print("\nCalibrating Auto bidder")
 
-    value_multiplier = (
+    conversion_multiplier = (
         find_multiplier_for_budget(
             valid,
-            valid["pred_value"].values,
+            valid["pcvr"].values,
             validation_budget,
         )
     )
 
     print(
-        "\nCTR bid multiplier:",
-        ctr_multiplier
+        f"\nCTR bid multiplier       : "
+        f"{ctr_multiplier}"
     )
 
     print(
-        "Value bid multiplier:",
-        value_multiplier
+        f"Conversion bid multiplier: "
+        f"{conversion_multiplier}"
     )
 
     # ========================================================
-    # Test auction replay
+    # 5. Test bidding
     # ========================================================
 
+    # Baseline:
+    # bid proportional to pCTR
     baseline_bids = (
         test["pctr"].values
         * ctr_multiplier
     )
 
+    # Auto bidder:
+    # bid proportional to conversion probability
     autobid_bids = (
-        test["pred_value"].values
-        * value_multiplier
+        test["pcvr"].values
+        * conversion_multiplier
     )
+
+    # ========================================================
+    # 6. Offline auction replay
+    # ========================================================
 
     baseline_metrics = simulate_auction(
         test,
         baseline_bids,
-        budget=budget,
+        budget=target_budget,
     )
 
     autobid_metrics = simulate_auction(
         test,
         autobid_bids,
-        budget=budget,
+        budget=target_budget,
     )
 
     print_comparison(
@@ -833,7 +779,7 @@ def main(args):
     )
 
     # ========================================================
-    # Additional diagnostics
+    # 7. Diagnostics
     # ========================================================
 
     print("\n" + "=" * 80)
@@ -841,23 +787,23 @@ def main(args):
     print("=" * 80)
 
     print(
-        f"Mean pCTR       : "
+        f"Mean pCTR        : "
         f"{test['pctr'].mean():.6f}"
     )
 
     print(
-        f"Actual CTR      : "
+        f"Actual CTR       : "
         f"{test['click'].mean():.6f}"
     )
 
     print(
-        f"Mean pred value : "
-        f"{test['pred_value'].mean():.6f}"
+        f"Mean pCVR        : "
+        f"{test['pcvr'].mean():.6f}"
     )
 
     print(
-        f"Actual value    : "
-        f"{test['realized_value'].mean():.6f}"
+        f"Actual conversion: "
+        f"{test['conversion'].mean():.6f}"
     )
 
 
